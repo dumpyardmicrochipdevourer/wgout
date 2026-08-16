@@ -26,7 +26,7 @@
 # This is the same mechanism Mullvad uses for split tunneling on Linux.
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 
 CGROUP_NAME="wgout"
 CGROUP_ROOT="/sys/fs/cgroup"
@@ -59,6 +59,15 @@ examples:
   WGOUT_IFACE=awg0 wgout curl ifconfig.me
 EOF
 }
+
+need_root() {
+    if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi
+}
+
+# Querying a WireGuard device goes through netlink and needs CAP_NET_ADMIN, so
+# detection has to run privileged too. Every user-facing subcommand therefore
+# re-executes this script once through need_root and does all of its work
+# there: one password prompt, and a sudoers entry naming wgout alone is enough.
 
 # ── interface / backend detection ──────────────────────────────────────────
 # Both `wg` and `awg` expose the same CLI. Try each and keep whichever knows
@@ -100,13 +109,9 @@ detect_backend() {
     IFACE="$first_iface"
 }
 
-need_root() {
-    if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi
-}
-
 # ── setup ──────────────────────────────────────────────────────────────────
 do_setup() {
-    local mark="$1" owner="$2"
+    local mark="$1" pid="$2" iface="$3"
 
     command -v nft >/dev/null 2>&1 || die "nftables is not installed"
     [ -f "$CGROUP_ROOT/cgroup.controllers" ] || die "cgroup v2 is not mounted at $CGROUP_ROOT"
@@ -119,9 +124,12 @@ do_setup() {
     # stop matching. --stop removes both.
     mkdir -p "$CGROUP"
 
-    # Hand cgroup.procs to the user so they can move their own shell into the
-    # cgroup without sudo - otherwise the program itself would run as root.
-    chown "$owner" "$CGROUP/cgroup.procs"
+    # The caller is moved into the cgroup from here, while we still have root.
+    # Handing the file to the user with chown is not enough: cgroup v2
+    # delegation also requires write access to cgroup.procs of the common
+    # ancestor of the source and destination cgroups, which is the root cgroup,
+    # so an unprivileged self-migration fails with EACCES.
+    echo "$pid" > "$CGROUP/cgroup.procs"
 
     # `type route` (not filter) is required: changing the mark in output must
     # trigger a route re-lookup, otherwise the packet follows the route that
@@ -132,6 +140,18 @@ do_setup() {
     # 53 would leave the program unable to resolve anything at all. Trade-off:
     # DNS queries stay visible to the VPN and a CDN may hand out an address
     # optimal for the tunnel exit rather than for the direct path.
+    #
+    # The nat chain is not optional. The source address is chosen at connect()
+    # time, before the output hook runs, so it is the tunnel's own address; the
+    # re-lookup only changes the outgoing device. Without masquerade the packet
+    # leaves the physical interface carrying a private VPN address and no reply
+    # can come back.
+    #
+    # It cannot match the cgroup directly - `socket cgroupv2` in a nat hook is
+    # rejected with EOPNOTSUPP - and matching the fwmark alone would also catch
+    # WireGuard's own encrypted packets, which carry the same mark by design.
+    # So the route hook, where the cgroup is still visible, stamps the
+    # conntrack entry, and the nat hook matches that instead.
     nft -f - <<NFT
 add table ${NFT_FAMILY} ${NFT_NAME}
 delete table ${NFT_FAMILY} ${NFT_NAME}
@@ -139,15 +159,22 @@ table ${NFT_FAMILY} ${NFT_NAME} {
     chain out {
         type route hook output priority mangle; policy accept;
         socket cgroupv2 level 1 "${CGROUP_NAME}" meta l4proto { tcp, udp } th dport 53 return
-        socket cgroupv2 level 1 "${CGROUP_NAME}" counter meta mark set ${mark}
+        socket cgroupv2 level 1 "${CGROUP_NAME}" counter meta mark set ${mark} ct mark set 0x1
+    }
+
+    chain post {
+        type nat hook postrouting priority srcnat; policy accept;
+        ct mark 0x1 oifname != "${iface}" counter masquerade
     }
 }
 NFT
 }
 
 do_stop() {
-    need_root nft delete table "$NFT_FAMILY" "$NFT_NAME" 2>/dev/null || true
-    need_root rmdir "$CGROUP" 2>/dev/null || true
+    nft delete table "$NFT_FAMILY" "$NFT_NAME" 2>/dev/null || true
+    # Fails while a bypassed program is still running; the cgroup is then left
+    # behind on purpose, and the next --stop clears it.
+    rmdir "$CGROUP" 2>/dev/null || true
     echo "wgout: rules removed"
 }
 
@@ -160,27 +187,30 @@ do_status() {
     fi
 
     if [ -d "$CGROUP" ]; then
-        echo "cgroup:    $CGROUP ($(grep -c . "$CGROUP/cgroup.procs" 2>/dev/null || echo 0) processes)"
+        echo "cgroup:    $CGROUP ($(wc -l < "$CGROUP/cgroup.procs" 2>/dev/null || echo 0) processes)"
     else
         echo "cgroup:    not created"
     fi
 
     echo "nftables:"
-    need_root nft list table "$NFT_FAMILY" "$NFT_NAME" 2>/dev/null | sed 's/^/  /' || echo "  table not installed"
+    nft list table "$NFT_FAMILY" "$NFT_NAME" 2>/dev/null | sed 's/^/  /' || echo "  table not installed"
 }
 
 # ── main ───────────────────────────────────────────────────────────────────
 case "${1:-}" in
-    --internal-setup) do_setup "$2" "$3"; exit 0 ;;
-    --stop)           do_stop; exit 0 ;;
-    --status)         do_status; exit 0 ;;
-    --version)        echo "wgout $VERSION"; exit 0 ;;
-    ""|-h|--help)     usage; exit 0 ;;
+    --internal-setup)  do_setup "$2" "$3" "$4"; exit 0 ;;
+    --internal-stop)   do_stop; exit 0 ;;
+    --internal-status) do_status; exit 0 ;;
+    --internal-detect) detect_backend
+                       echo "$WG_CMD $IFACE $("$WG_CMD" show "$IFACE" fwmark 2>/dev/null || true)"
+                       exit 0 ;;
+    --stop)            need_root "$0" --internal-stop; exit 0 ;;
+    --status)          need_root "$0" --internal-status; exit 0 ;;
+    --version)         echo "wgout $VERSION"; exit 0 ;;
+    ""|-h|--help)      usage; exit 0 ;;
 esac
 
-detect_backend
-
-MARK=$("$WG_CMD" show "$IFACE" fwmark 2>/dev/null || true)
+read -r WG_CMD IFACE MARK <<<"$(need_root "$0" --internal-detect)"
 
 if [ -z "$MARK" ] || [ "$MARK" = "off" ]; then
     die "interface '$IFACE' does not use a fwmark.
@@ -189,9 +219,8 @@ Bypassing is only meaningful when all traffic is routed into the tunnel
 reaches the internet directly anyway."
 fi
 
-need_root "$0" --internal-setup "$MARK" "$(id -un)"
-
-# Join the cgroup before exec so children inherit it.
-echo $$ > "$CGROUP/cgroup.procs" || die "failed to join cgroup $CGROUP"
+# Setup runs as root and moves this shell into the cgroup on the way, so the
+# program started below inherits the membership and so do its children.
+need_root "$0" --internal-setup "$MARK" "$$" "$IFACE"
 
 exec "$@"
