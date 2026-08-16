@@ -1,0 +1,197 @@
+#!/bin/bash
+# wgout - run a program outside the WireGuard tunnel.
+#
+#   wgout firefox         # firefox goes direct, everything else stays tunneled
+#   wgout --status        # show current state
+#   wgout --stop          # remove rules
+#
+# Works with WireGuard (wg) and AmneziaWG (awg). Linux only.
+#
+# ── How it works ───────────────────────────────────────────────────────────
+# wg-quick with AllowedIPs = 0.0.0.0/0 does not put a default route in the
+# main table. Instead it installs two ip rules:
+#
+#   32764: not from all fwmark 0xca6c lookup 51820   <- unmarked goes to tunnel
+#   32766: from all lookup main                      <- marked lands here
+#
+# The fwmark exists so WireGuard's own encrypted packets are not routed back
+# into the tunnel. That gives us the trick: mark an application's traffic with
+# the SAME fwmark and rule 32764 skips it, so it falls through to the main
+# table and leaves via the normal gateway. No extra routing table needed.
+#
+# The application is identified by cgroup v2 rather than by process name: the
+# process is placed in a dedicated cgroup and nftables matches on
+# `socket cgroupv2`. This survives fork/exec and covers child processes.
+#
+# This is the same mechanism Mullvad uses for split tunneling on Linux.
+set -euo pipefail
+
+VERSION="1.0.0"
+
+CGROUP_NAME="wgout"
+CGROUP_ROOT="/sys/fs/cgroup"
+CGROUP="${CGROUP_ROOT}/${CGROUP_NAME}"
+NFT_FAMILY="inet"
+NFT_NAME="wgout"
+
+IFACE="${WGOUT_IFACE:-}"
+WG_CMD=""
+
+die() { echo "wgout: $*" >&2; exit 1; }
+
+usage() {
+    cat <<'EOF'
+wgout - run a program outside the WireGuard tunnel
+
+usage:
+  wgout <command> [args...]   run command with traffic bypassing the tunnel
+  wgout --status              show current state
+  wgout --stop                remove nftables rules and cgroup
+  wgout --version             print version
+  wgout --help                this text
+
+environment:
+  WGOUT_IFACE   tunnel interface to bypass (default: first wg/awg interface)
+
+examples:
+  wgout firefox
+  wgout qbittorrent
+  WGOUT_IFACE=awg0 wgout curl ifconfig.me
+EOF
+}
+
+# ── interface / backend detection ──────────────────────────────────────────
+# Both `wg` and `awg` expose the same CLI. Try each and keep whichever knows
+# about the interface, so the script works for plain WireGuard and AmneziaWG
+# without a flag.
+detect_backend() {
+    local cmd i mark
+    local first_cmd="" first_iface="" found=0
+
+    if [ -n "$IFACE" ]; then
+        for cmd in awg wg; do
+            command -v "$cmd" >/dev/null 2>&1 || continue
+            if "$cmd" show "$IFACE" >/dev/null 2>&1; then
+                WG_CMD="$cmd"
+                return 0
+            fi
+        done
+        die "interface '$IFACE' not found by wg or awg (is the tunnel up?)"
+    fi
+
+    for cmd in awg wg; do
+        command -v "$cmd" >/dev/null 2>&1 || continue
+        for i in $("$cmd" show interfaces 2>/dev/null || true); do
+            found=1
+            [ -n "$first_cmd" ] || { first_cmd="$cmd"; first_iface="$i"; }
+            mark=$("$cmd" show "$i" fwmark 2>/dev/null || true)
+            if [ -n "$mark" ] && [ "$mark" != "off" ]; then
+                WG_CMD="$cmd"
+                IFACE="$i"
+                return 0
+            fi
+        done
+    done
+
+    [ "$found" -eq 1 ] || die "no WireGuard or AmneziaWG interface is up"
+
+    # Nothing has a fwmark; fall back so the guard below reports why.
+    WG_CMD="$first_cmd"
+    IFACE="$first_iface"
+}
+
+need_root() {
+    if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi
+}
+
+# ── setup ──────────────────────────────────────────────────────────────────
+do_setup() {
+    local mark="$1" owner="$2"
+
+    command -v nft >/dev/null 2>&1 || die "nftables is not installed"
+    [ -f "$CGROUP_ROOT/cgroup.controllers" ] || die "cgroup v2 is not mounted at $CGROUP_ROOT"
+
+    # ORDER MATTERS: nft resolves the cgroup path to an inode when the rule is
+    # loaded, so the directory has to exist first. Otherwise:
+    #   Error: cgroupv2 path fails: No such file or directory
+    # For the same reason the cgroup must not be removed while the rule is
+    # loaded: the rule would keep a reference to a vanished inode and silently
+    # stop matching. --stop removes both.
+    mkdir -p "$CGROUP"
+
+    # Hand cgroup.procs to the user so they can move their own shell into the
+    # cgroup without sudo - otherwise the program itself would run as root.
+    chown "$owner" "$CGROUP/cgroup.procs"
+
+    # `type route` (not filter) is required: changing the mark in output must
+    # trigger a route re-lookup, otherwise the packet follows the route that
+    # was already chosen, i.e. straight into the tunnel.
+    #
+    # DNS is deliberately NOT marked. The resolver handed out by the tunnel
+    # usually lives inside it and is unreachable from outside, so marking port
+    # 53 would leave the program unable to resolve anything at all. Trade-off:
+    # DNS queries stay visible to the VPN and a CDN may hand out an address
+    # optimal for the tunnel exit rather than for the direct path.
+    nft -f - <<NFT
+add table ${NFT_FAMILY} ${NFT_NAME}
+delete table ${NFT_FAMILY} ${NFT_NAME}
+table ${NFT_FAMILY} ${NFT_NAME} {
+    chain out {
+        type route hook output priority mangle; policy accept;
+        socket cgroupv2 level 1 "${CGROUP_NAME}" meta l4proto { tcp, udp } th dport 53 return
+        socket cgroupv2 level 1 "${CGROUP_NAME}" counter meta mark set ${mark}
+    }
+}
+NFT
+}
+
+do_stop() {
+    need_root nft delete table "$NFT_FAMILY" "$NFT_NAME" 2>/dev/null || true
+    need_root rmdir "$CGROUP" 2>/dev/null || true
+    echo "wgout: rules removed"
+}
+
+do_status() {
+    if detect_backend 2>/dev/null; then
+        echo "interface: $IFACE (via $WG_CMD)"
+        echo "fwmark:    $("$WG_CMD" show "$IFACE" fwmark 2>/dev/null || echo unknown)"
+    else
+        echo "interface: no tunnel is up"
+    fi
+
+    if [ -d "$CGROUP" ]; then
+        echo "cgroup:    $CGROUP ($(grep -c . "$CGROUP/cgroup.procs" 2>/dev/null || echo 0) processes)"
+    else
+        echo "cgroup:    not created"
+    fi
+
+    echo "nftables:"
+    need_root nft list table "$NFT_FAMILY" "$NFT_NAME" 2>/dev/null | sed 's/^/  /' || echo "  table not installed"
+}
+
+# ── main ───────────────────────────────────────────────────────────────────
+case "${1:-}" in
+    --internal-setup) do_setup "$2" "$3"; exit 0 ;;
+    --stop)           do_stop; exit 0 ;;
+    --status)         do_status; exit 0 ;;
+    --version)        echo "wgout $VERSION"; exit 0 ;;
+    ""|-h|--help)     usage; exit 0 ;;
+esac
+
+detect_backend
+
+MARK=$("$WG_CMD" show "$IFACE" fwmark 2>/dev/null || true)
+
+if [ -z "$MARK" ] || [ "$MARK" = "off" ]; then
+    die "interface '$IFACE' does not use a fwmark.
+Bypassing is only meaningful when all traffic is routed into the tunnel
+(AllowedIPs = 0.0.0.0/0). If AllowedIPs is already narrowed, the program
+reaches the internet directly anyway."
+fi
+
+need_root "$0" --internal-setup "$MARK" "$(id -un)"
+
+# Join the cgroup before exec so children inherit it.
+echo $$ > "$CGROUP/cgroup.procs" || die "failed to join cgroup $CGROUP"
+
+exec "$@"
